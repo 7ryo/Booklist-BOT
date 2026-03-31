@@ -1,0 +1,12 @@
+discord.py==2.7.1
+python-dotenv==1.0.1
+
+langchain==1.2.13
+langchain-community==0.4.1
+langchain-core==1.2.21
+langchain-google-genai==4.2.1
+
+notion-client==3.0.0
+tavily-python==0.7.23
+pydantic==2.12.5
+aiohttp==3.13.3

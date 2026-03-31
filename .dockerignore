@@ -1,0 +1,6 @@
+.env
+__pycache__/
+.git/
+.venv/
+*.log
+.be_ignored/
