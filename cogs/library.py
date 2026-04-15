@@ -28,6 +28,10 @@ class Library(commands.Cog):
     - 'year': 這是【出版年份】，不是出版社。範例: 2024
     - 'publisher': 這是【出版社名稱】。範例: 遠流、時報
 
+    ### 使用者隱私規範：
+    1. 在生成查詢book資料表的SQL query時，永遠必須包含discord_user_id = '{discord_user_id}'，避免使用者看到其他使用者的資料。
+    2. 如果使用者沒有提供discord_user_id，則不應該生成SQL query。
+
     ### 使用者問題：  
     {input}   
 
@@ -61,10 +65,15 @@ class Library(commands.Cog):
 
         async with ctx.typing(): # 會顯示：正在輸入中...
             try:
+                discord_user_id = str(ctx.author.id)
                 sql_query = self.sql_generator.invoke({
                     "table_info": self.table_info,
+                    "discord_user_id": discord_user_id,
                     "input": question
-                })
+                }, config=self.bot.get_langchain_config(
+                    trace_name="discord.!lib",
+                    user_id=discord_user_id
+                ))
 
                 print(sql_query)
 
@@ -80,6 +89,7 @@ class Library(commands.Cog):
 
                 if not list_results:
                     await ctx.send("沒有找到東西。可能是關鍵字不對或是程式抽風。請再試一次。")
+                    return
             
                 
                 embed = discord.Embed(title="圖書狀況", color=discord.Color.green())

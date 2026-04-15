@@ -1,14 +1,35 @@
 import os
+import atexit
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langfuse import Langfuse
+from langfuse.langchain import CallbackHandler
 
 from utils.chains import create_intent_chain
 from utils.web_tools import SearchService
 
 
 load_dotenv()
+
+
+def init_langfuse():
+    secret_key = os.getenv("LANGFUSE_SECRET_KEY")
+    public_key = os.getenv("LANGFUSE_PUBLIC_KEY")
+    host = os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com")
+
+    if not secret_key or not public_key:
+        print("Langfuse 未啟用：請設定 LANGFUSE_SECRET_KEY 與 LANGFUSE_PUBLIC_KEY。")
+        return None
+
+    langfuse_client = Langfuse(
+        secret_key=secret_key,
+        public_key=public_key,
+        host=host,
+    )
+    atexit.register(langfuse_client.flush)
+    return CallbackHandler()
 
 class Bot(commands.Bot):
     def __init__(self):
@@ -23,11 +44,27 @@ class Bot(commands.Bot):
 
         # 3. init LLM
         # llm: Gemma 3 4b
-        self.llm = ChatGoogleGenerativeAI(model="gemma-3-4b-it")
+        self.langfuse_handler = init_langfuse()
+        llm_kwargs = {"model": "gemma-3-4b-it"}
+        if self.langfuse_handler:
+            llm_kwargs["callbacks"] = [self.langfuse_handler]
+
+        self.llm = ChatGoogleGenerativeAI(**llm_kwargs)
         self.intent_parser = create_intent_chain(self.llm)
 
         # 4. 其他tools
         self.search_service = SearchService()
+
+    def get_langchain_config(self, trace_name: str, user_id: str | None = None):
+        config = {
+            "run_name": trace_name,
+            "metadata": {"source": "discord-bot"},
+        }
+        if user_id:
+            config["metadata"]["discord_user_id"] = str(user_id)
+        if self.langfuse_handler:
+            config["callbacks"] = [self.langfuse_handler]
+        return config
 
 
     # load cogs

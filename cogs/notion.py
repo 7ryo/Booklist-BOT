@@ -70,7 +70,13 @@ class Notion(commands.Cog):
         # ainvoke = async invoke
         # return type: JSON
         # 因為是 async function -> 記得加 await
-        result = await self.bot.intent_parser.ainvoke({"input": user_input})
+        result = await self.bot.intent_parser.ainvoke(
+            {"input": user_input},
+            config=self.bot.get_langchain_config(
+                trace_name="discord.!note",
+                user_id=ctx.author.id
+            )
+        )
         print(result)
 
         if result['intent'] == 'SEARCH':
@@ -191,7 +197,13 @@ class Notion(commands.Cog):
         await ctx.typing()
 
 
-        response = await self.recommend_chain.ainvoke(title)
+        response = await self.recommend_chain.ainvoke(
+            title,
+            config=self.bot.get_langchain_config(
+                trace_name="discord.!recommend",
+                user_id=ctx.author.id
+            )
+        )
         await ctx.send(response)
 
 
