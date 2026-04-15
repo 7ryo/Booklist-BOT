@@ -45,14 +45,66 @@ class AddInfoModal(discord.ui.Modal, title="補充書籍資訊"):
                 author=self.author.value or None,
                 status=self.status,
                 source=self.source.value or "圖書館實體書",
-                remark=self.remark.value or None
+                remark=self.remark.value or None,
+                user_id=str(interaction.user.id),
             )
 
             if self.content:
-                await self.parent_cog._append_content(page_id=new_page['id'], content=self.content)
+                await self.parent_cog._append_content(
+                    page_id=new_page['id'],
+                    content=self.content,
+                    user_id=str(interaction.user.id),
+                )
             
             await interaction.followup.send(f"已經幫你新增《{self.book_title}》了！")
     
+
+# Modal: collect user's Notion config
+class NotionConfigModal(discord.ui.Modal, title="設定你的 Notion 連線"):
+    notion_api_key = discord.ui.TextInput(
+        label="Notion API Key",
+        placeholder="ntn_xxx 或 secret_xxx",
+        required=True,
+    )
+    notion_database_id = discord.ui.TextInput(
+        label="Notion Database ID",
+        placeholder="貼上 Notion database id",
+        required=True,
+    )
+
+    def __init__(self, parent_cog):
+        super().__init__()
+        self.parent_cog = parent_cog
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        try:
+            await self.parent_cog.save_user_notion_config(
+                user_id=str(interaction.user.id),
+                notion_api_key=self.notion_api_key.value.strip(),
+                notion_database_id=self.notion_database_id.value.strip(),
+            )
+            await interaction.followup.send(
+                "Notion 設定已儲存，現在可以重新執行 `!note` 或 `!recommend`。",
+                ephemeral=True,
+            )
+        except Exception as e:
+            await interaction.followup.send(
+                f"儲存失敗：{str(e)[:120]}",
+                ephemeral=True,
+            )
+
+
+class NotionConfigSetupView(discord.ui.View):
+    def __init__(self, parent_cog):
+        super().__init__(timeout=120)
+        self.parent_cog = parent_cog
+
+    @discord.ui.button(label="設定 Notion API / DB", style=discord.ButtonStyle.blurple)
+    async def setup_notion_config(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(NotionConfigModal(self.parent_cog))
+        self.stop()
+
 
 # UI View
 
@@ -100,10 +152,18 @@ class ConfirmUpdateView(discord.ui.View):
         async with interaction.channel.typing():
             # update status
             if self.status:
-                await self.parent_cog._notion_update_properties(self.page_id, self.status)
+                await self.parent_cog._notion_update_properties(
+                    self.page_id,
+                    self.status,
+                    user_id=str(interaction.user.id),
+                )
 
             if self.content:
-                await self.parent_cog._append_content(self.page_id, self.content)
+                await self.parent_cog._append_content(
+                    self.page_id,
+                    self.content,
+                    user_id=str(interaction.user.id),
+                )
 
         await interaction.followup.send(f"已更新《{self.title}》")
         self.stop()

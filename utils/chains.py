@@ -1,7 +1,7 @@
 
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser, StrOutputParser
-from langchain_core.runnables import RunnableLambda, RunnableParallel, RunnablePassthrough, RunnableBranch
+from langchain_core.runnables import RunnableLambda, RunnableParallel, RunnableBranch
 
 
 # 因為 notion的呼叫指令!note中包含了搜尋/新增兩種動作
@@ -81,10 +81,10 @@ def create_recommend_chain(llm, search_service, get_notion_func):
     # 避免被說never await
     async def _async_get_notion(inputs):
         title = inputs.get("book_title")
+        user_id = inputs.get("user_id")
         print(f" title: {title}; type = {type(title)}")
-        # return await get_notion_func(title)
         if callable(get_notion_func):
-            return await get_notion_func(title)
+            return await get_notion_func(title=title, user_id=user_id)
         return get_notion_func
 
 
@@ -131,13 +131,15 @@ def create_recommend_chain(llm, search_service, get_notion_func):
     chain = (
         RunnableParallel({
             "book_title": query_extractor,
-            "original_input": RunnablePassthrough()
+            "original_input": lambda x: x["input"],
+            "user_id": lambda x: x.get("user_id"),
         })
         | RunnableParallel({
             # 會搜尋使用者心得
             "book_title": lambda x: x["book_title"],
             "user_context": RunnableLambda(_async_get_notion),
-            "original_input":lambda x: x["original_input"]
+            "original_input": lambda x: x["original_input"],
+            "user_id": lambda x: x["user_id"],
         })
         | RunnableParallel({
             # book_title和user_context會從前一個RunnableParallel傳過來
