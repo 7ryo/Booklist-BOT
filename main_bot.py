@@ -70,7 +70,7 @@ class Bot(commands.Bot):
 
     # load cogs
     async def setup_hook(self):
-        for extention in ['cogs.library', 'cogs.notion']:
+        for extention in ['cogs.library', 'cogs.notion', 'cogs.audit']:
             try:
                 await self.load_extension(extention)
                 print(f"成功載入{extention}")
