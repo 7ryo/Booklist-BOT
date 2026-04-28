@@ -20,6 +20,10 @@ class NotionService:
         self.notion_config_cache = {}
         self.langfuse = get_client()
 
+    @staticmethod
+    def _user_message(prefix: str, exc: Exception) -> str:
+        return f"{prefix}（{str(exc)[:120]}）"
+
     def _get_cached_runtime(self, user_id: str):
         cached = self.notion_config_cache.get(user_id)
         if not cached:
@@ -105,51 +109,86 @@ class NotionService:
             raise ValueError("資料庫連線未設定，請確認 USER_DB_CONNECT_URI")
 
         with self.langfuse.start_as_current_observation(as_type="span", name="Notion_ACTION") as span:
-            safe_user_id = str(user_id).replace("'", "''")
-            safe_api_key = notion_api_key.replace("'", "''")
-            safe_database_id = notion_database_id.replace("'", "''")
-            upsert_sql = f"""
-            INSERT INTO user_notion_config (discord_user_id, notion_token, database_id)
-            VALUES ('{safe_user_id}', '{safe_api_key}', '{safe_database_id}')
-            ON CONFLICT (discord_user_id)
-            DO UPDATE SET
-                notion_token = EXCLUDED.notion_token,
-                database_id = EXCLUDED.database_id
-            """
-            self.sql_db.run(upsert_sql)
+            try:
+                safe_user_id = str(user_id).replace("'", "''")
+                safe_api_key = notion_api_key.replace("'", "''")
+                safe_database_id = notion_database_id.replace("'", "''")
+                upsert_sql = f"""
+                INSERT INTO user_notion_config (discord_user_id, notion_token, database_id)
+                VALUES ('{safe_user_id}', '{safe_api_key}', '{safe_database_id}')
+                ON CONFLICT (discord_user_id)
+                DO UPDATE SET
+                    notion_token = EXCLUDED.notion_token,
+                    database_id = EXCLUDED.database_id
+                """
+                self.sql_db.run(upsert_sql)
 
-            self.notion_config_cache.pop(str(user_id), None)
-            self._build_runtime(
-                user_id=str(user_id),
-                notion_api_key=notion_api_key,
-                notion_database_id=notion_database_id,
-            )
-            span.update(
-                tags=["ERP_LOG"],
-                metadata={
-                    "user_id": str(user_id),
-                    "display_text": "已更新 Notion 帳號連線設定。",
-                },
-            )
+                self.notion_config_cache.pop(str(user_id), None)
+                self._build_runtime(
+                    user_id=str(user_id),
+                    notion_api_key=notion_api_key,
+                    notion_database_id=notion_database_id,
+                )
+                span.update(
+                    tags=["ERP_LOG"],
+                    metadata={
+                        "user_id": str(user_id),
+                        "display_text": "已更新 Notion 帳號連線設定。",
+                    },
+                )
+            except Exception as exc:
+                readable_error = self._user_message("更新 Notion 帳號連線設定失敗", exc)
+                span.update(
+                    level="ERROR",
+                    tags=["ERP_LOG"],
+                    metadata={
+                        "user_id": str(user_id),
+                        "display_text": readable_error,
+                    },
+                )
+                raise NotionServiceError(readable_error) from exc
 
     async def query_database(self, user_id: str, title=None, author=None, status=None):
-        runtime = self.get_user_runtime(user_id)
-        if not runtime:
-            raise NotionServiceError("尚未設定 Notion 連線資訊。")
+        with self.langfuse.start_as_current_observation(as_type="span", name="Notion_ACTION") as span:
+            try:
+                runtime = self.get_user_runtime(user_id)
+                if not runtime:
+                    raise NotionServiceError("尚未設定 Notion 連線資訊。")
 
-        filters = []
-        if title:
-            filters.append({"property": "題名", "title": {"contains": title}})
-        if author:
-            filters.append({"property": "作者", "multi_select": {"contains": author}})
-        if status:
-            filters.append({"property": "閱讀狀態", "status": {"equals": status}})
+                filters = []
+                if title:
+                    filters.append({"property": "題名", "title": {"contains": title}})
+                if author:
+                    filters.append({"property": "作者", "multi_select": {"contains": author}})
+                if status:
+                    filters.append({"property": "閱讀狀態", "status": {"equals": status}})
 
-        query_filter = {"and": filters} if len(filters) > 1 else (filters[0] if filters else None)
-        return runtime["notion"].data_sources.query(
-            data_source_id=runtime["data_source_id"],
-            filter=query_filter,
-        )
+                query_filter = {"and": filters} if len(filters) > 1 else (filters[0] if filters else None)
+                result = runtime["notion"].data_sources.query(
+                    data_source_id=runtime["data_source_id"],
+                    filter=query_filter,
+                )
+                span.update(
+                    tags=["ERP_LOG"],
+                    metadata={
+                        "user_id": str(user_id),
+                        "display_text": "已查詢 Notion 書籍資料。",
+                    },
+                )
+                return result
+            except Exception as exc:
+                readable_error = self._user_message("查詢 Notion 資料失敗", exc)
+                span.update(
+                    level="ERROR",
+                    tags=["ERP_LOG"],
+                    metadata={
+                        "user_id": str(user_id),
+                        "display_text": readable_error,
+                    },
+                )
+                if isinstance(exc, NotionServiceError):
+                    raise
+                raise NotionServiceError(readable_error) from exc
 
 
     async def create_page(
@@ -162,129 +201,216 @@ class NotionService:
         remark=None,
     ):
         with self.langfuse.start_as_current_observation(as_type="span", name="Notion_ACTION") as span:
-            runtime = self.get_user_runtime(user_id)
-            if not runtime:
-                raise NotionServiceError("尚未設定 Notion 連線資訊。")
+            try:
+                runtime = self.get_user_runtime(user_id)
+                if not runtime:
+                    raise NotionServiceError("尚未設定 Notion 連線資訊。")
 
-            properties = {
-                "題名": {"title": [{"text": {"content": title}}]},
-            }
-            if source:
-                properties["來源"] = {"select": {"name": source}}
-            if status:
-                properties["閱讀狀態"] = {"status": {"name": status}}
-            if author:
-                properties["作者"] = {"multi_select": [{"name": author}]}
-            if remark:
-                properties["備註"] = {"rich_text": [{"text": {"content": remark}}]}
-            if status == "已閱讀":
-                today_str = datetime.now().strftime("%Y-%m-%d")
-                properties["閱讀日期"] = {"date": {"start": today_str}}
+                properties = {
+                    "題名": {"title": [{"text": {"content": title}}]},
+                }
+                if source:
+                    properties["來源"] = {"select": {"name": source}}
+                if status:
+                    properties["閱讀狀態"] = {"status": {"name": status}}
+                if author:
+                    properties["作者"] = {"multi_select": [{"name": author}]}
+                if remark:
+                    properties["備註"] = {"rich_text": [{"text": {"content": remark}}]}
+                if status == "已閱讀":
+                    today_str = datetime.now().strftime("%Y-%m-%d")
+                    properties["閱讀日期"] = {"date": {"start": today_str}}
 
-            print(properties)
+                print(properties)
 
-            result = runtime["notion"].pages.create(
-                parent={"data_source_id": runtime["data_source_id"]},
-                properties=properties,
-            )
-            span.update(
-                tags=["ERP_LOG"],
-                metadata={
-                    "user_id": str(user_id),
-                    "display_text": f"已在 Notion 新增書籍《{title}》。",
-                },
-            )
-            return result
+                result = runtime["notion"].pages.create(
+                    parent={"data_source_id": runtime["data_source_id"]},
+                    properties=properties,
+                )
+                span.update(
+                    tags=["ERP_LOG"],
+                    metadata={
+                        "user_id": str(user_id),
+                        "display_text": f"已在 Notion 新增書籍《{title}》。",
+                    },
+                )
+                return result
+            except Exception as exc:
+                readable_error = self._user_message(f"新增《{title}》到 Notion 失敗", exc)
+                span.update(
+                    level="ERROR",
+                    tags=["ERP_LOG"],
+                    metadata={
+                        "user_id": str(user_id),
+                        "display_text": readable_error,
+                    },
+                )
+                if isinstance(exc, NotionServiceError):
+                    raise
+                raise NotionServiceError(readable_error) from exc
 
     async def append_content(self, user_id: str, page_id: str, content: str):
         if not content:
             return
 
         with self.langfuse.start_as_current_observation(as_type="span", name="Notion_ACTION") as span:
-            runtime = self.get_user_runtime(user_id)
-            if not runtime:
-                raise NotionServiceError("尚未設定 Notion 連線資訊。")
+            try:
+                runtime = self.get_user_runtime(user_id)
+                if not runtime:
+                    raise NotionServiceError("尚未設定 Notion 連線資訊。")
 
-            blocks = [
-                {
-                    "object": "block",
-                    "type": "paragraph",
-                    "paragraph": {
-                        "rich_text": [{"type": "text", "text": {"content": line}}],
+                blocks = [
+                    {
+                        "object": "block",
+                        "type": "paragraph",
+                        "paragraph": {
+                            "rich_text": [{"type": "text", "text": {"content": line}}],
+                        },
+                    }
+                    for line in content.split("\n")
+                ]
+                result = runtime["notion"].blocks.children.append(block_id=page_id, children=blocks)
+                span.update(
+                    tags=["ERP_LOG"],
+                    metadata={
+                        "user_id": str(user_id),
+                        "display_text": f"新增心得：{content[:20]}...",
                     },
-                }
-                for line in content.split("\n")
-            ]
-            result = runtime["notion"].blocks.children.append(block_id=page_id, children=blocks)
-            span.update(
-                tags=["ERP_LOG"],
-                metadata={
-                    "user_id": str(user_id),
-                    "display_text": f"新增心得：{content[:20]}...",
-                },
-            )
-            return result
+                )
+                return result
+            except Exception as exc:
+                readable_error = self._user_message("新增心得到 Notion 失敗", exc)
+                span.update(
+                    level="ERROR",
+                    tags=["ERP_LOG"],
+                    metadata={
+                        "user_id": str(user_id),
+                        "display_text": readable_error,
+                    },
+                )
+                if isinstance(exc, NotionServiceError):
+                    raise
+                raise NotionServiceError(readable_error) from exc
 
     async def update_page_properties(self, user_id: str, page_id: str, status: str):
         if not status:
             return
 
         with self.langfuse.start_as_current_observation(as_type="span", name="Notion_ACTION") as span:
-            runtime = self.get_user_runtime(user_id)
-            if not runtime:
-                raise NotionServiceError("尚未設定 Notion 連線資訊。")
+            try:
+                runtime = self.get_user_runtime(user_id)
+                if not runtime:
+                    raise NotionServiceError("尚未設定 Notion 連線資訊。")
 
-            update_items = {"閱讀狀態": {"status": {"name": status}}}
-            if status == "已閱讀":
-                today_str = datetime.now().strftime("%Y-%m-%d")
-                update_items["閱讀日期"] = {"date": {"start": today_str}}
+                update_items = {"閱讀狀態": {"status": {"name": status}}}
+                if status == "已閱讀":
+                    today_str = datetime.now().strftime("%Y-%m-%d")
+                    update_items["閱讀日期"] = {"date": {"start": today_str}}
 
-            result = runtime["notion"].pages.update(page_id=page_id, properties=update_items)
-            span.update(
-                tags=["ERP_LOG"],
-                metadata={
-                    "user_id": str(user_id),
-                    "display_text": f"已更新 Notion 書籍狀態為「{status}」。",
-                },
-            )
-            return result
+                result = runtime["notion"].pages.update(page_id=page_id, properties=update_items)
+                span.update(
+                    tags=["ERP_LOG"],
+                    metadata={
+                        "user_id": str(user_id),
+                        "display_text": f"已更新 Notion 書籍狀態為「{status}」。",
+                    },
+                )
+                return result
+            except Exception as exc:
+                readable_error = self._user_message("更新 Notion 書籍狀態失敗", exc)
+                span.update(
+                    level="ERROR",
+                    tags=["ERP_LOG"],
+                    metadata={
+                        "user_id": str(user_id),
+                        "display_text": readable_error,
+                    },
+                )
+                if isinstance(exc, NotionServiceError):
+                    raise
+                raise NotionServiceError(readable_error) from exc
 
     async def get_page_content(self, user_id: str, title: str):
-        search_results = await self.query_database(user_id=user_id, title=title)
-        if not search_results.get("results"):
-            return None
+        with self.langfuse.start_as_current_observation(as_type="span", name="Notion_ACTION") as span:
+            try:
+                search_results = await self.query_database(user_id=user_id, title=title)
+                if not search_results.get("results"):
+                    return None
 
-        runtime = self.get_user_runtime(user_id)
-        if not runtime:
-            return None
+                runtime = self.get_user_runtime(user_id)
+                if not runtime:
+                    return None
 
-        first_page = search_results["results"][0]
-        page_id = first_page["id"]
-        full_book_title = first_page["properties"]["題名"]["title"][0]["plain_text"]
-        response = runtime["notion"].blocks.children.list(block_id=page_id)
+                first_page = search_results["results"][0]
+                page_id = first_page["id"]
+                full_book_title = first_page["properties"]["題名"]["title"][0]["plain_text"]
+                response = runtime["notion"].blocks.children.list(block_id=page_id)
 
-        paragraphs = []
-        for block in response.get("results", []):
-            block_type = block.get("type")
-            if block_type == "paragraph":
-                rich_text = block["paragraph"].get("rich_text", [])
-                if rich_text:
-                    paragraphs.append(rich_text[0].get("plain_text", ""))
-            elif block_type == "bulleted_list_item":
-                rich_text = block["bulleted_list_item"].get("rich_text", [])
-                if rich_text:
-                    paragraphs.append(f"- {rich_text[0].get('plain_text', '')}")
+                paragraphs = []
+                for block in response.get("results", []):
+                    block_type = block.get("type")
+                    if block_type == "paragraph":
+                        rich_text = block["paragraph"].get("rich_text", [])
+                        if rich_text:
+                            paragraphs.append(rich_text[0].get("plain_text", ""))
+                    elif block_type == "bulleted_list_item":
+                        rich_text = block["bulleted_list_item"].get("rich_text", [])
+                        if rich_text:
+                            paragraphs.append(f"- {rich_text[0].get('plain_text', '')}")
 
-        full_content = "\n".join(paragraphs)
-        if not full_content.strip():
-            return {"book_title": full_book_title, "content": None}
-        return {"book_title": full_book_title, "content": full_content}
+                full_content = "\n".join(paragraphs)
+                span.update(
+                    tags=["ERP_LOG"],
+                    metadata={
+                        "user_id": str(user_id),
+                        "display_text": f"已讀取《{title}》的 Notion 心得內容。",
+                    },
+                )
+                if not full_content.strip():
+                    return {"book_title": full_book_title, "content": None}
+                return {"book_title": full_book_title, "content": full_content}
+            except Exception as exc:
+                readable_error = self._user_message(f"讀取《{title}》心得失敗", exc)
+                span.update(
+                    level="ERROR",
+                    tags=["ERP_LOG"],
+                    metadata={
+                        "user_id": str(user_id),
+                        "display_text": readable_error,
+                    },
+                )
+                if isinstance(exc, NotionServiceError):
+                    raise
+                raise NotionServiceError(readable_error) from exc
 
     async def test_connection(self, user_id: str, page_size: int = 1):
-        runtime = self.get_user_runtime(user_id)
-        if not runtime:
-            raise NotionServiceError("尚未設定 Notion 連線資訊。")
-        return runtime["notion"].data_sources.query(
-            data_source_id=runtime["data_source_id"],
-            page_size=page_size,
-        )
+        with self.langfuse.start_as_current_observation(as_type="span", name="Notion_ACTION") as span:
+            try:
+                runtime = self.get_user_runtime(user_id)
+                if not runtime:
+                    raise NotionServiceError("尚未設定 Notion 連線資訊。")
+                result = runtime["notion"].data_sources.query(
+                    data_source_id=runtime["data_source_id"],
+                    page_size=page_size,
+                )
+                span.update(
+                    tags=["ERP_LOG"],
+                    metadata={
+                        "user_id": str(user_id),
+                        "display_text": "已完成 Notion 連線測試。",
+                    },
+                )
+                return result
+            except Exception as exc:
+                readable_error = self._user_message("Notion 連線測試失敗", exc)
+                span.update(
+                    level="ERROR",
+                    tags=["ERP_LOG"],
+                    metadata={
+                        "user_id": str(user_id),
+                        "display_text": readable_error,
+                    },
+                )
+                if isinstance(exc, NotionServiceError):
+                    raise
+                raise NotionServiceError(readable_error) from exc
