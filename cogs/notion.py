@@ -1,17 +1,16 @@
 import os
 import discord
 import json
-import ast
-from datetime import datetime, timedelta
 from discord.ext import commands
-from notion_client import Client
-from langchain_community.utilities import SQLDatabase
+from langfuse import observe
 
 import importlib
 import utils.ui, utils.chains
+from utils.notion_service import NotionService, NotionServiceError
 
 importlib.reload(utils.ui)
 importlib.reload(utils.chains)
+importlib.reload(utils.notion_service)
 
 from utils.ui import ConfirmAddView, ConfirmUpdateView, AddInfoModal, NotionConfigSetupView
 from utils.chains import create_intent_chain, create_recommend_chain
@@ -21,9 +20,7 @@ class Notion(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.db_url = os.getenv("USER_DB_CONNECT_URI")
-        self.sql_db = SQLDatabase.from_uri(self.db_url) if self.db_url else None
-        self.notion_config_cache = {}
-        self.cache_ttl = timedelta(minutes=10)
+        self.notion_service = NotionService(db_url=self.db_url)
         self.recommend_chain = create_recommend_chain(
             llm=bot.llm,
             search_service=bot.search_service,
@@ -32,116 +29,22 @@ class Notion(commands.Cog):
         if not self.db_url:
             print("請在.env檔案中設定USER_DB_CONNECT_URI")
 
-    def _get_cached_runtime(self, user_id: str):
-        cached = self.notion_config_cache.get(user_id)
-        if not cached:
-            return None
-        if cached["expires_at"] <= datetime.utcnow():
-            self.notion_config_cache.pop(user_id, None)
-            return None
-        return cached
-
-    def _load_user_config_from_db(self, user_id: str):
-        if not self.sql_db:
-            print("no sql_db")
-            return None
-
-        safe_user_id = str(user_id).replace("'", "''")
-        sql = (
-            "SELECT notion_token, database_id "
-            "FROM user_notion_config "
-            f"WHERE discord_user_id = '{safe_user_id}' "
-            "LIMIT 1"
-        )
-        print(sql)
-        raw_row = self.sql_db.run(sql, fetch="one")
-        if not raw_row:
-            return None
-
-        try:
-            row = ast.literal_eval(raw_row)[0] # list of tuples [0]
-        except (SyntaxError, ValueError):
-            return None
-
-        if not isinstance(row, (tuple, list)) or len(row) < 2:
-            return None
-
-        notion_api_key = row[0]
-        print(notion_api_key)
-        notion_database_id = row[1]
-        if not notion_api_key or not notion_database_id:
-            return None
-        return {
-            "notion_api_key": notion_api_key,
-            "notion_database_id": notion_database_id,
-        }
-
-    def _build_runtime(self, user_id: str, notion_api_key: str, notion_database_id: str):
-        notion_client = Client(auth=notion_api_key)
-        database = notion_client.databases.retrieve(database_id=notion_database_id)
-        data_sources = database.get("data_sources", [])
-        if not data_sources:
-            raise ValueError("找不到 Notion data source，請確認 database id 是否正確。")
-
-        runtime = {
-            "notion": notion_client,
-            "database_id": notion_database_id,
-            "data_source_id": data_sources[0]["id"],
-            "expires_at": datetime.utcnow() + self.cache_ttl,
-        }
-        self.notion_config_cache[user_id] = runtime
-        return runtime
-
-    def _get_user_runtime(self, user_id: str):
-        cached = self._get_cached_runtime(user_id)
-        if cached:
-            return cached
-
-        config = self._load_user_config_from_db(user_id)
-        if not config:
-            print("no config")
-            return None
-
-        try:
-            return self._build_runtime(
-                user_id=user_id,
-                notion_api_key=config["notion_api_key"],
-                notion_database_id=config["notion_database_id"],
-            )
-        except Exception as e:
-            print(f"Notion runtime init失敗(user={user_id}): {e}")
-            return None
-
     async def save_user_notion_config(self, user_id: str, notion_api_key: str, notion_database_id: str):
-        if not self.sql_db:
-            raise ValueError("資料庫連線未設定，請確認 USER_DB_CONNECT_URI")
-
-        safe_user_id = str(user_id).replace("'", "''")
-        safe_api_key = notion_api_key.replace("'", "''")
-        safe_database_id = notion_database_id.replace("'", "''")
-        upsert_sql = f"""
-        INSERT INTO user_notion_config (discord_user_id, notion_api_key, notion_database_id)
-        VALUES ('{safe_user_id}', '{safe_api_key}', '{safe_database_id}')
-        ON CONFLICT (discord_user_id)
-        DO UPDATE SET
-            notion_api_key = EXCLUDED.notion_api_key,
-            notion_database_id = EXCLUDED.notion_database_id
-        """
-        self.sql_db.run(upsert_sql)
-
-        # refresh cache after write
-        self.notion_config_cache.pop(str(user_id), None)
-        self._build_runtime(
-            user_id=str(user_id),
+        await self.notion_service.save_user_notion_config(
+            user_id=user_id,
             notion_api_key=notion_api_key,
             notion_database_id=notion_database_id,
         )
 
     async def _ensure_user_runtime(self, ctx):
         user_id = str(ctx.author.id)
-        runtime = self._get_user_runtime(user_id)
-        if runtime:
-            return runtime
+        try:
+            runtime = self.notion_service.get_user_runtime(user_id)
+            if runtime:
+                return runtime
+        except NotionServiceError as e:
+            await ctx.send(f"Notion 連線失敗：{e}")
+            return None
 
         view = NotionConfigSetupView(self)
         await ctx.send(
@@ -154,16 +57,7 @@ class Notion(commands.Cog):
     async def test_notion(self, ctx): # 因為沒有要輸入什麼所以不需要後面的 ＊question
         async with ctx.typing():
             try:
-                runtime = await self._ensure_user_runtime(ctx)
-                if not runtime:
-                    return
-
-                # 3. query the "data source"
-
-                response = runtime["notion"].data_sources.query(
-                    data_source_id=runtime["data_source_id"],
-                    page_size=1
-                )
+                response = await self.notion_service.test_connection(user_id=str(ctx.author.id), page_size=1)
 
                 print(json.dumps(response, indent=2, ensure_ascii=False))
 
@@ -175,11 +69,15 @@ class Notion(commands.Cog):
                 first_page = response['results'][0]
                 properties = first_page.get("properties", {})
 
+            except NotionServiceError as e:
+                await ctx.send(f"Notion 連線失敗：{e}")
             except Exception as e:
                 print(f"test_notion出問題: {e}")
+                await ctx.send("test_notion 執行失敗：Notion 暫時無法連線或發生未知錯誤，請稍後再試。")
 
 
     @commands.command(name="note")
+    @observe(name="能看到這個!note嗎", as_type="span")
     async def smart_note(self, ctx, *, user_input: str):
         runtime = await self._ensure_user_runtime(ctx)
         if not runtime:
@@ -191,13 +89,16 @@ class Notion(commands.Cog):
         # ainvoke = async invoke
         # return type: JSON
         # 因為是 async function -> 記得加 await
-        result = await self.bot.intent_parser.ainvoke(
-            {"input": user_input},
-            config=self.bot.get_langchain_config(
-                trace_name="discord.!note",
-                user_id=ctx.author.id
+        try:
+            result = await self.bot.intent_parser.ainvoke(
+                {"input": user_input},
+                config=self.bot.get_langchain_config(
+                    trace_name="discord.!note",
+                    user_id=ctx.author.id
+                )
             )
-        )
+        except Exception:
+            return await ctx.send("我現在無法判斷你的指令意圖（LLM 暫時無法使用或連線異常），請稍後再試。")
         print(result)
 
         if result['intent'] == 'SEARCH':
@@ -209,12 +110,17 @@ class Notion(commands.Cog):
 
     # in smart_note
     async def handle_notion_search(self, ctx, params, user_id: str):
-        response = await self._notion_search(
-            title=params.get("title"),
-            author=params.get("author"),
-            status=params.get("status"),
-            user_id=user_id,
-        )
+        try:
+            response = await self._notion_search(
+                title=params.get("title"),
+                author=params.get("author"),
+                status=params.get("status"),
+                user_id=user_id,
+            )
+        except NotionServiceError as e:
+            return await ctx.send(f"Notion 操作失敗：{e}")
+        except Exception:
+            return await ctx.send("Notion 搜尋失敗：目前 Notion 可能無法連線，請稍後再試。")
 
         # print(f"response type: {type(response)}")
         # type: dict
@@ -244,7 +150,12 @@ class Notion(commands.Cog):
             return await ctx.send("你沒有給我書名QAQ")
         
         # 先search看有沒有已經建立過了，如果建立過了就變成修改欄位內容
-        search_result = await self._notion_search(title=title, user_id=user_id)
+        try:
+            search_result = await self._notion_search(title=title, user_id=user_id)
+        except NotionServiceError as e:
+            return await ctx.send(f"Notion 操作失敗：{e}")
+        except Exception:
+            return await ctx.send("Notion 搜尋失敗：目前 Notion 可能無法連線，請稍後再試。")
         if search_result.get("results"):
             page_id = search_result["results"][0]["id"]
             view = ConfirmUpdateView(self, page_id=page_id, title=title, content=content, status=status)
@@ -265,20 +176,30 @@ class Notion(commands.Cog):
 
 
         # create new page
-        new_page = await self._notion_create_note(
-            title=title,
-            author=author,
-            status=status,
-            source=source,
-            user_id=user_id,
-            # 日期
-        )
+        try:
+            new_page = await self._notion_create_note(
+                title=title,
+                author=author,
+                status=status,
+                source=source,
+                user_id=user_id,
+                # 日期
+            )
+        except NotionServiceError as e:
+            return await ctx.send(f"Notion 新增失敗：{e}")
+        except Exception:
+            return await ctx.send("Notion 新增失敗：目前 Notion 可能無法連線，請稍後再試。")
         # await ctx.send(f"已在資料庫中新建{title}！\n連結: {new_page['url']}")
 
         page_id = new_page['id']
 
         if content:
-            await self._append_content(page_id=page_id, content=content, user_id=user_id)
+            try:
+                await self._append_content(page_id=page_id, content=content, user_id=user_id)
+            except NotionServiceError as e:
+                return await ctx.send(f"已新增《{title}》，但追加心得失敗：{e}")
+            except Exception:
+                return await ctx.send(f"已新增《{title}》，但追加心得失敗：Notion 可能暫時無法連線，請稍後再試。")
             await ctx.send(f"已新增{title}和心得。")
         else:
             await ctx.send(f"已新增《{title}》。")
@@ -292,7 +213,12 @@ class Notion(commands.Cog):
         content=params.get("content")
 
         # 1. 先搜尋有沒有這本書，有的話才能update
-        response = await self._notion_search(title=title, user_id=user_id)
+        try:
+            response = await self._notion_search(title=title, user_id=user_id)
+        except NotionServiceError as e:
+            return await ctx.send(f"Notion 操作失敗：{e}")
+        except Exception:
+            return await ctx.send("Notion 搜尋失敗：目前 Notion 可能無法連線，請稍後再試。")
         results = response.get("results", [])
         print(results)
 
@@ -305,11 +231,21 @@ class Notion(commands.Cog):
 
         # 2. 更新properties
         if status:
-            await self._notion_update_properties(page_id=page_id, status=status, user_id=user_id)
+            try:
+                await self._notion_update_properties(page_id=page_id, status=status, user_id=user_id)
+            except NotionServiceError as e:
+                return await ctx.send(f"Notion 更新失敗：{e}")
+            except Exception:
+                return await ctx.send("Notion 更新失敗：目前 Notion 可能無法連線，請稍後再試。")
     
         # 3. 有心得(content)的話也要更新
         if content:
-            await self._append_content(page_id=page_id, content=content, user_id=user_id)
+            try:
+                await self._append_content(page_id=page_id, content=content, user_id=user_id)
+            except NotionServiceError as e:
+                return await ctx.send(f"Notion 追加心得失敗：{e}")
+            except Exception:
+                return await ctx.send("Notion 追加心得失敗：目前 Notion 可能無法連線，請稍後再試。")
 
         #
         await ctx.send(f"已更新《{title}》")
@@ -338,172 +274,46 @@ class Notion(commands.Cog):
     # ------------------------------------------------
     # search
     async def _notion_search(self, title=None, author=None, status=None, user_id=None):
-        # notion search 是使用 filter
-        print("_notion_search() is called")
-        if not user_id:
-            return {"results": []}
-
-        runtime = self._get_user_runtime(str(user_id))
-        if not runtime:
-            return {"results": []}
-
-        filters = []
-        if title:
-            filters.append({"property": "題名", "title": {"contains": title}})
-        if author:
-            filters.append({"property": "作者", "multi_select": {"contains": author}})
-        if status:
-            filters.append({"property": "閱讀狀態", "status": {"equals": status}})
-        
-        # 有多個條件的時候要用and串起來
-        # 「JSON 樹狀結構」
-        query_filter = {"and": filters} if len(filters) > 1 else (filters[0] if filters else None)
-
-        print(f"query_filter: {query_filter}")
-        return runtime["notion"].data_sources.query(
-            data_source_id=runtime["data_source_id"],
-            filter=query_filter
+        return await self.notion_service.query_database(
+            user_id=str(user_id) if user_id else "",
+            title=title,
+            author=author,
+            status=status,
         )
 
     # create new note
     async def _notion_create_note(self, title, author=None, status="待閱讀", source=None, readdate=None, remark=None, user_id=None):
-        runtime = self._get_user_runtime(str(user_id)) if user_id else None
-        if not runtime:
-            raise ValueError("找不到此使用者的 Notion 設定，請先完成設定。")
-
-        properties = {
-            "題名": {"title": [{"text": {"content": title}}]},
-            "來源": {"select": {"name": source}},
-            "閱讀狀態": {"status": {"name": status}}
-        }
-        if author:
-            properties["作者"] = {"multi_select": [{"name": author}]}
-
-        if remark:
-            properties['備註'] = {"rich_text": [{"text": {"content": remark}}]}
-
-        # notion date property -> ISO 8601
-        if status == "已閱讀":
-            today_str = datetime.now().strftime("%Y-%m-%d")
-            properties["閱讀日期"] = {"date": {"start": today_str}}
-        
-        return runtime["notion"].pages.create(
-            parent={"data_source_id": runtime["data_source_id"]},
-            properties=properties
+        return await self.notion_service.create_page(
+            user_id=str(user_id) if user_id else "",
+            title=title,
+            author=author,
+            status=status,
+            source=source,
+            remark=remark,
         )
 
     # 新增notion children (心得等)
     async def _append_content(self, page_id, content, user_id=None):
-        # content 理論上要是markdown，但是不確定
-        if not content:
-            return
-        runtime = self._get_user_runtime(str(user_id)) if user_id else None
-        if not runtime:
-            raise ValueError("找不到此使用者的 Notion 設定，請先完成設定。")
-        
-        # 要把換行拆成不同的block (記得notion裡面不同block可以拖來拖去)
-        lines = content.split('\n')
-        blocks = [
-            {
-                "object": "block",
-                "type": "paragraph",
-                "paragraph": {
-                    "rich_text": [{"type": "text", "text": {"content": line}}] #單數的line
-                }
-            } for line in lines
-        ]
-
-        # blocks = [
-        #     {
-        #         "object": "block",
-        #         "type": "paragraph",
-        #         "paragraph": {
-        #             "rich_text": [{"type": "text", "text": {"content": content}}] #單數的line
-        #         }
-        #     } 
-        # ]
-
-        return runtime["notion"].blocks.children.append(
-            block_id=page_id,
-            children=blocks
+        return await self.notion_service.append_content(
+            user_id=str(user_id) if user_id else "",
+            page_id=page_id,
+            content=content,
         )
 
     # 更新或修改 properties
     async def _notion_update_properties(self, page_id, status, user_id=None):
-        if not status:
-            return
-        runtime = self._get_user_runtime(str(user_id)) if user_id else None
-        if not runtime:
-            raise ValueError("找不到此使用者的 Notion 設定，請先完成設定。")
-        update_items = {}
-        update_items['閱讀狀態'] = {"status": {"name": status}}
-        
-        # 如果看完了 也要把日期更新上去
-        if status == "已閱讀":
-            today_str = datetime.now().strftime("%Y-%m-%d")
-            update_items['閱讀日期'] = {"date": {"start": today_str}}
-
-        if update_items:
-            runtime["notion"].pages.update(page_id=page_id, properties=update_items)
+        return await self.notion_service.update_page_properties(
+            user_id=str(user_id) if user_id else "",
+            page_id=page_id,
+            status=status,
+        )
 
     # 獲取notion children
     async def _get_page_content(self, title, user_id=None):
-        """
-        抓notion頁面中的所有blocks作為 RAG Context
-        因為notion return的格式非常非常多層，只要把真正的內容抓出來就好
-        """
         try:
             if not user_id:
                 return None
-
-            runtime = self._get_user_runtime(str(user_id))
-            if not runtime:
-                return None
-
-            search_results = await self._notion_search(title=title, user_id=str(user_id))
-            if not search_results.get("results"):
-                print("Notion沒有找到這本書，會切換成general recommend")
-                return None
-
-            first_page = search_results["results"][0]
-            page_id = search_results["results"][0]["id"]
-            # response = await self.notion.blocks.children.list(block_id=page_id)
-
-            # full book title
-            full_book_title = first_page['properties']['題名']['title'][0]['plain_text']
-
-            response = runtime["notion"].blocks.children.list(block_id=page_id)
-
-
-            paragraphs = []
-            for block in response.get("results", []):
-                # 因為只要抓文字的block
-                block_type = block.get("type")
-                if block_type == "paragraph":
-                    rich_text = block["paragraph"].get("rich_text", [])
-                    if rich_text:
-                        paragraphs.append(rich_text[0].get("plain_text", ""))
-                elif block_type == "bulleted_list_item":
-                    rich_text = block["bulleted_list_item"].get("rich_text", [])
-                    if rich_text:
-                        paragraphs.append(f"- {rich_text[0].get('plain_text', '')}")
-                
-            # 組合起來
-            # 不過也要確保有東西
-            full_content = "\n".join(paragraphs)
-            # print(f"full_content: {full_content}")
-            if not full_content.strip():
-                print(f"no full_content, will return None~~~~~~~~")
-                return {
-                    "book_title": full_book_title,
-                    "content": None
-                }
-            else:
-                return {
-                    "book_title": full_book_title,
-                    "content": full_content
-                }
-            
+            return await self.notion_service.get_page_content(user_id=str(user_id), title=title)
         except Exception as e:
             print(f"Error at _get_page_content: {e}")
             return ""

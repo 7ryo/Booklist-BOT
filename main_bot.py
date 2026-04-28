@@ -4,7 +4,7 @@ import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langfuse import Langfuse
+from langfuse import get_client
 from langfuse.langchain import CallbackHandler
 
 from utils.chains import create_intent_chain
@@ -23,11 +23,12 @@ def init_langfuse():
         print("Langfuse 未啟用：請設定 LANGFUSE_SECRET_KEY 與 LANGFUSE_PUBLIC_KEY。")
         return None
 
-    langfuse_client = Langfuse(
-        secret_key=secret_key,
-        public_key=public_key,
-        host=host,
-    )
+    # 這邊是給observe用的變數，需要export到環境變數
+    os.environ["LANGFUSE_SECRET_KEY"] = secret_key
+    os.environ["LANGFUSE_PUBLIC_KEY"] = public_key
+    os.environ["LANGFUSE_HOST"] = host
+    
+    langfuse_client = get_client()
     atexit.register(langfuse_client.flush)
     return CallbackHandler()
 
